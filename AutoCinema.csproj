@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>AutoCinema</AssemblyName>
+    <RootNamespace>FishLeia.AutoCinema</RootNamespace>
+    <Version>1.0.0</Version>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="ETS2LA.Shared" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Shared.dll" Private="false" />
+    <Reference Include="ETS2LA.Backend" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Backend.dll" Private="false" />
+    <Reference Include="ETS2LA.Game" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Game.dll" Private="false" />
+    <Reference Include="ETS2LA.Settings" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Settings.dll" Private="false" />
+    <Reference Include="ETS2LA.Overlay" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Overlay.dll" Private="false" />
+    <Reference Include="ETS2LA.Logging" HintPath="$(LOCALAPPDATA)\ETS2LA\current\ETS2LA.Logging.dll" Private="false" />
+    <Reference Include="Hexa.NET.ImGui" HintPath="$(LOCALAPPDATA)\ETS2LA\current\Hexa.NET.ImGui.dll" Private="false" />
+  </ItemGroup>
+
+</Project>
