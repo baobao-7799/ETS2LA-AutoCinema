@@ -9,10 +9,14 @@ public class CinemaSettings
 {
     public bool Enabled = true;
     public bool ShowWindow = true;
-    public bool RequireAutopilot = true;
+
+    // 默认不强制要求自动驾驶：真正的"空闲"（键鼠 + 方向盘/油门/刹车都没动）即可进入。
+    // 需要"必须在自动驾驶时才进入"时再打开 RequireAutopilot。
+    public bool RequireAutopilot = false;
     public bool UseChannelDetection = true;
     public bool UseTelemetryHeuristic = true;
-    public bool RequireMoving = true;
+    public bool RequireMoving = false;
+
     public bool HideOverlay = true;
     public bool HideGameHud = false;
 
