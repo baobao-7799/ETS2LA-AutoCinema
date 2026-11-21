@@ -34,9 +34,9 @@ public class AutoCinemaPlugin : Plugin
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     private const int SwHide = 0;
-    private const int SwShowNa = 8; // show without activating / stealing focus
-    private const string OverlayWindowTitle = "ETS2LA Overlay";
+    private const int SwShowNa = 8; // show without stealing focus
 
+    private const string OverlayWindowTitle = "ETS2LA Overlay";
     private const string CameraChannelId = "fishleia.autocinema";
     private const string HudChannelId = "fishleia.autocinema.hud";
     private const string WindowTitle = "baobao-7799 自动电影镜头";
@@ -47,20 +47,32 @@ public class AutoCinemaPlugin : Plugin
 
     private readonly SettingsHandler _settingsHandler = new();
     private CinemaSettings _cfg = new();
-    private volatile bool _settingsDirty = false;
+    private volatile bool _settingsDirty;
     private DateTime _lastSave = DateTime.MinValue;
 
     private Mode _state = Mode.Monitoring;
     private DateTime _cooldownUntil = DateTime.MinValue;
-    private DateTime? _apSince = null;
-    private bool _autopilotSustained = false;
-    private float _idleSeconds = 0f;
-    private float _speed = 0f;
+
+    private readonly Stopwatch _sw = Stopwatch.StartNew();
+    private float _now;
+    private float _lastUserAct = float.MinValue;   // 最近一次方向盘/踏板输入（秒）
+    private bool _liiFailed;                        // GetLastInputInfo 是否失败
+    private DateTime? _apSince;
+    private bool _autopilotSustained;
+    private float _idleSeconds;
+    private float _speed;
     private readonly Stopwatch _cinemaT = new Stopwatch();
-    private bool _overlayHidden = false;
-    private bool _gameHudToggled = false;
-    private bool _manualCinema = false;
+    private bool _overlayHidden;
+    private bool _gameHudToggled;                   // 游戏 HUD 是否被本插件切走
+    private bool _gameHudEverOn;                    // 是否曾经切过 HUD（退出时只回切一次）
+    private bool _manualCinema;
     private string _status = "待机中";
+
+    // 诊断量（UI 显示）
+    private bool _channelActive;
+    private bool _cruiseOn;
+    private bool _gameAiOn;
+    private bool _userActNow;
 
     private readonly ConcurrentDictionary<string, DateTime> _otherChannels = new();
 
@@ -68,8 +80,8 @@ public class AutoCinemaPlugin : Plugin
     {
         Id = "fishleia.autocinema",
         Name = "baobao-7799 自动电影镜头",
-        Description = "自动驾驶期间长时间无操作时自动切换电影镜头（类 GTA），并隐藏 ETS2LA 覆盖层。",
-        Version = "1.0.0",
+        Description = "长时间未操作电脑时自动切换电影镜头（类 GTA），并隐藏 ETS2LA 覆盖层；动键鼠/方向盘立刻恢复。",
+        Version = "1.1.0",
         AuthorName = "baobao-7799",
         AppVersionSupport = new PluginVersionSupport { LowerBound = "2026.11.0" },
         Tags = new[] { "camera", "cinematic", "idle", "hud" },
@@ -86,23 +98,29 @@ public class AutoCinemaPlugin : Plugin
     public override void OnEnable()
     {
         base.OnEnable();
-        Events.Current.Subscribe<ControlEvent>(OutputTopic, OnAnyControlEvent);
-        OverlayHandler.Current.RegisterWindow(new WindowDefinition
+        try { Events.Current.Subscribe<ControlEvent>(OutputTopic, OnAnyControlEvent); }
+        catch (Exception ex) { Logger.Error(ex.ToString(), "AutoCinema: subscribe failed."); }
+        try
         {
-            Title = WindowTitle,
-            Width = 440,
-            Height = 480,
-            Alpha = 0.92f,
-            Open = _cfg.ShowWindow,
-        }, RenderUI);
+            OverlayHandler.Current.RegisterWindow(new WindowDefinition
+            {
+                Title = WindowTitle,
+                Width = 440,
+                Height = 500,
+                Alpha = 0.92f,
+                Open = _cfg.ShowWindow,
+            }, RenderUI);
+        }
+        catch (Exception ex) { Logger.Error(ex.ToString(), "AutoCinema: register window failed."); }
+        _lastUserAct = _now;
     }
 
     public override void OnDisable()
     {
-        base.OnDisable();
-        Events.Current.Unsubscribe<ControlEvent>(OutputTopic, OnAnyControlEvent);
-        OverlayHandler.Current.UnregisterWindow(new WindowDefinition { Title = WindowTitle });
+        try { Events.Current.Unsubscribe<ControlEvent>(OutputTopic, OnAnyControlEvent); } catch { }
+        try { OverlayHandler.Current.UnregisterWindow(new WindowDefinition { Title = WindowTitle }); } catch { }
         ExitCinematicSafe();
+        base.OnDisable();
     }
 
     public override void Shutdown()
@@ -122,26 +140,53 @@ public class AutoCinemaPlugin : Plugin
         catch { }
     }
 
-    private static float GetIdleSeconds()
+    private static float GetSystemIdleSeconds(out bool failed)
     {
+        failed = false;
         var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
-        if (!GetLastInputInfo(ref lii)) return 0f;
-        uint now = GetTickCount();
-        uint idle = now - lii.dwTime;
-        return idle / 1000f;
+        if (!GetLastInputInfo(ref lii))
+        {
+            failed = true;
+            return 0f;
+        }
+        return (GetTickCount() - lii.dwTime) / 1000f;
     }
 
     public override void Tick()
     {
         try
         {
+            _now = (float)_sw.Elapsed.TotalSeconds;
+
             var td = GameTelemetry.Current.GetCurrentData();
             _speed = td.truckFloat.speed;
-            _idleSeconds = GetIdleSeconds();
 
+            // ---- 空闲：键鼠空闲 与 游戏输入空闲 取较小者（手柄/方向盘也算"人还在"）----
+            float sysIdle = GetSystemIdleSeconds(out bool liiFailed);
+            _liiFailed = liiFailed;
+            float userAct = Math.Abs(td.truckFloat.userSteer)
+                + td.truckFloat.userThrottle
+                + td.truckFloat.userBrake
+                + td.truckFloat.userClutch;
+            _userActNow = userAct > 0.05f;
+            if (_userActNow) _lastUserAct = _now;
+            float teleIdle = _now - _lastUserAct;
+            _idleSeconds = _liiFailed ? teleIdle : Math.Min(sysIdle, teleIdle);
+
+            // ---- 自动驾驶检测（诊断用；RequireAutopilot 才强制要求）----
             DateTime now = DateTime.UtcNow;
-            bool rawActive = DetectAutopilotRaw(td);
-            if (rawActive)
+            _channelActive = false;
+            foreach (var kv in _otherChannels)
+            {
+                if ((now - kv.Value).TotalSeconds < 1.0) { _channelActive = true; break; }
+            }
+            _cruiseOn = td.truckBool.cruiseControl;
+            _gameAiOn = Math.Abs(td.truckFloat.gameSteer) > 0.02f || td.truckFloat.gameThrottle > 0.05f;
+            bool userRecent = (_now - _lastUserAct) < 1.5f;
+            bool heuristic = td.truckBool.engineEnabled && _speed > _cfg.MinSpeed && !userRecent && (_gameAiOn || _cruiseOn);
+            bool detected = (_cfg.UseChannelDetection && _channelActive) || (_cfg.UseTelemetryHeuristic && heuristic);
+
+            if (detected)
             {
                 if (!_apSince.HasValue) _apSince = now;
             }
@@ -154,58 +199,30 @@ public class AutoCinemaPlugin : Plugin
 
             switch (_state)
             {
-                case Mode.Monitoring:
-                    TickMonitoring(td);
-                    break;
-                case Mode.Cinematic:
-                    TickCinematic(td);
-                    break;
+                case Mode.Monitoring: TickMonitoring(td); break;
+                case Mode.Cinematic: TickCinematic(td); break;
                 case Mode.Cooldown:
-                    if (now >= _cooldownUntil)
-                    {
-                        _state = Mode.Monitoring;
-                        _status = "待机中";
-                    }
-                    else
-                    {
-                        double left = (_cooldownUntil - now).TotalSeconds;
-                        _status = $"冷却中 {left:F0}s";
-                    }
+                    if (now >= _cooldownUntil) { _state = Mode.Monitoring; _status = "待机中"; }
+                    else _status = $"冷却中 {(_cooldownUntil - now).TotalSeconds:F0}s";
                     break;
+            }
+
+            // ---- 看门狗：只要不在电影镜头状态，覆盖层和游戏 HUD 必须恢复 ----
+            if (_state != Mode.Cinematic)
+            {
+                if (_overlayHidden) HideOverlay(false);
+                if (_gameHudToggled) ToggleGameHud(false);
             }
         }
         catch (Exception ex)
         {
             Logger.Error(ex.ToString(), "AutoCinema tick error");
+            // 出异常也不能把 HUD 留在藏起来的状态
+            if (_overlayHidden) HideOverlay(false);
+            if (_gameHudToggled) ToggleGameHud(false);
         }
 
         SaveIfDirty();
-    }
-
-    private bool DetectAutopilotRaw(GameTelemetryData td)
-    {
-        bool channelActive = false;
-        DateTime now = DateTime.UtcNow;
-        foreach (var kv in _otherChannels)
-        {
-            if ((now - kv.Value).TotalSeconds < 0.6)
-            {
-                channelActive = true;
-                break;
-            }
-        }
-
-        bool heuristic = td.truckFloat.speed > _cfg.MinSpeed
-            && Math.Abs(td.truckFloat.userSteer) < 0.02f
-            && Math.Abs(td.truckFloat.userThrottle) < 0.02f
-            && Math.Abs(td.truckFloat.userBrake) < 0.02f
-            && (Math.Abs(td.truckFloat.gameSteer) > 0.02f
-                || td.truckFloat.gameThrottle > 0.05f
-                || td.truckBool.cruiseControl);
-
-        bool detected = (_cfg.UseChannelDetection && channelActive)
-            || (_cfg.UseTelemetryHeuristic && heuristic);
-        return detected;
     }
 
     private void TickMonitoring(GameTelemetryData td)
@@ -218,6 +235,7 @@ public class AutoCinemaPlugin : Plugin
 
         bool want = td.sdkActive
             && !td.paused
+            && td.truckBool.engineEnabled
             && (!_cfg.RequireMoving || _speed > 1f)
             && (!_cfg.RequireAutopilot || _autopilotSustained)
             && (_manualCinema || _idleSeconds >= _cfg.IdleSeconds);
@@ -230,6 +248,7 @@ public class AutoCinemaPlugin : Plugin
         {
             string why = !td.sdkActive ? "等待游戏"
                 : td.paused ? "游戏暂停"
+                : !td.truckBool.engineEnabled ? "车辆未点火"
                 : (_cfg.RequireMoving && _speed <= 1f) ? "车辆未行驶"
                 : (_cfg.RequireAutopilot && !_autopilotSustained) ? "未检测到自动驾驶"
                 : $"空闲 {_idleSeconds:F0}/{_cfg.IdleSeconds:F0}s";
@@ -239,10 +258,11 @@ public class AutoCinemaPlugin : Plugin
 
     private void TickCinematic(GameTelemetryData td)
     {
-        bool userBack = _cinemaT.Elapsed.TotalSeconds > 3.0 && _idleSeconds < 0.2f;
+        bool userBack = _cinemaT.Elapsed.TotalSeconds > 3.0 && (_idleSeconds < 0.2f || _userActNow);
         bool exit = !_cfg.Enabled
             || !td.sdkActive
             || td.paused
+            || !td.truckBool.engineEnabled
             || userBack
             || (_cfg.RequireAutopilot && !_autopilotSustained)
             || (_cfg.RequireMoving && _speed < 0.5f);
@@ -271,8 +291,7 @@ public class AutoCinemaPlugin : Plugin
 
     private void ExitCinematic()
     {
-        if (_state != Mode.Cinematic)
-            return;
+        if (_state != Mode.Cinematic) return;
 
         _state = Mode.Cooldown;
         _cooldownUntil = DateTime.UtcNow.AddSeconds(_cfg.UserCooldownSeconds);
@@ -294,6 +313,7 @@ public class AutoCinemaPlugin : Plugin
         ReleaseCamera();
         _state = Mode.Monitoring;
         _manualCinema = false;
+        _status = "待机中";
     }
 
     private void HideOverlay(bool hide)
@@ -303,6 +323,7 @@ public class AutoCinemaPlugin : Plugin
             IntPtr hwnd = FindWindowW(null, OverlayWindowTitle);
             if (hwnd == IntPtr.Zero)
             {
+                _overlayHidden = false;
                 Logger.Warn("AutoCinema: ETS2LA Overlay window not found.");
                 return;
             }
@@ -315,28 +336,56 @@ public class AutoCinemaPlugin : Plugin
         }
     }
 
+    // 游戏 HUD 切换：Direct 持续按住 400ms（比 50ms 脉冲可靠，虚拟手柄轮询不会漏掉）
     private void ToggleGameHud(bool intoCinematic)
     {
-        _gameHudToggled = intoCinematic;
         try
         {
-            Events.Current.Publish(OutputTopic, new ControlEvent
+            if (intoCinematic)
             {
-                ChannelDefinition = new ControlChannelDefinition { Id = HudChannelId, Timeout = 0.5f },
-                Properties = new ControlProperties { Weight = 1f, BooleanType = ControlBooleanType.TrueToToggle },
-                Variables = new ControlVariables { showhud = true },
-            });
-            // Remove the pulse channel shortly after so it can pulse again later.
+                if (_gameHudToggled) return;
+                _gameHudToggled = true;
+                _gameHudEverOn = true;
+                PublishHudHold();
+            }
+            else
+            {
+                if (!_gameHudToggled) return;
+                _gameHudToggled = false;
+                if (_gameHudEverOn) PublishHudHold(); // 再按一次切回原状态
+            }
             _ = Task.Run(async () =>
             {
                 await Task.Delay(400);
-                PublishRemove(HudChannelId);
+                PublishHudRelease();
             });
         }
         catch (Exception ex)
         {
             Logger.Error(ex.ToString(), "AutoCinema: game HUD toggle failed.");
         }
+    }
+
+    private void PublishHudHold()
+    {
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = HudChannelId, Timeout = 0.5f },
+            Properties = new ControlProperties { Weight = 1f, BooleanType = ControlBooleanType.Direct },
+            Variables = new ControlVariables { showhud = true },
+        });
+    }
+
+    private void PublishHudRelease()
+    {
+        // 先归零再删通道，防止 bool 残留在旧版 mmap
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = HudChannelId, Timeout = 0.5f },
+            Properties = new ControlProperties { Weight = 1f, BooleanType = ControlBooleanType.Direct },
+            Variables = new ControlVariables { showhud = false },
+        });
+        PublishRemove(HudChannelId);
     }
 
     private void PublishCameraFrame()
@@ -442,11 +491,13 @@ public class AutoCinemaPlugin : Plugin
     {
         ImGui.TextColored(new Vector4(1f, 0.9f, 0.4f, 1f), _status);
         ImGui.Text($"空闲 {_idleSeconds:F1}s | 速度 {_speed * 3.6f:F0} km/h");
-        ImGui.Text(_autopilotSustained ? "自动驾驶：检测到" : "自动驾驶：未检测到");
+        if (_liiFailed)
+            ImGui.TextColored(new Vector4(1f, 0.5f, 0.3f, 1f), "键鼠输入检测失败，改用方向盘/踏板空闲判定");
+        ImGui.Text($"通道输出:{(_channelActive ? "有" : "无")} 巡航:{(_cruiseOn ? "开" : "关")} AI驾驶:{(_gameAiOn ? "有" : "无")} 玩家输入:{(_userActNow ? "有" : "无")}");
         ImGui.Separator();
 
         ImGui.Text("镜头模式");
-        if (ImGui.Button("摇镜(车内/追尾通用)")) { _cfg.Mode = 0; _settingsDirty = true; }
+        if (ImGui.Button("摇镜(默认)")) { _cfg.Mode = 0; _settingsDirty = true; }
         ImGui.SameLine();
         if (ImGui.Button("GTA 环绕")) { _cfg.Mode = 1; _settingsDirty = true; }
         ImGui.SameLine();
@@ -457,13 +508,14 @@ public class AutoCinemaPlugin : Plugin
         if (ImGui.Checkbox("要求自动驾驶开启", ref _cfg.RequireAutopilot)) _settingsDirty = true;
         if (ImGui.Checkbox("要求车辆行驶中", ref _cfg.RequireMoving)) _settingsDirty = true;
         if (ImGui.Checkbox("隐藏 ETS2LA 覆盖层", ref _cfg.HideOverlay)) _settingsDirty = true;
-        if (ImGui.Checkbox("同时隐藏游戏 HUD", ref _cfg.HideGameHud)) _settingsDirty = true;
-        if (ImGui.Checkbox("输出通道检测", ref _cfg.UseChannelDetection)) _settingsDirty = true;
-        if (ImGui.Checkbox("遥测推断检测", ref _cfg.UseTelemetryHeuristic)) _settingsDirty = true;
+        if (ImGui.Checkbox("同时切换游戏 HUD", ref _cfg.HideGameHud)) _settingsDirty = true;
+        if (ImGui.Checkbox("通道检测(诊断)", ref _cfg.UseChannelDetection)) _settingsDirty = true;
+        if (ImGui.Checkbox("遥测推断(诊断)", ref _cfg.UseTelemetryHeuristic)) _settingsDirty = true;
         ImGui.Separator();
 
         if (ImGui.SliderFloat("进入空闲秒数", ref _cfg.IdleSeconds, 5f, 300f)) _settingsDirty = true;
         if (ImGui.SliderFloat("自动驾驶确认秒数", ref _cfg.AutoPilotConfirmSeconds, 1f, 30f)) _settingsDirty = true;
+        if (ImGui.SliderFloat("推断最低车速 m/s", ref _cfg.MinSpeed, 1f, 20f)) _settingsDirty = true;
         if (ImGui.SliderFloat("摇镜周期(秒)", ref _cfg.PanPeriodSeconds, 10f, 120f)) _settingsDirty = true;
         if (ImGui.SliderFloat("摇镜幅度", ref _cfg.PanAmplitude, 0.02f, 1f)) _settingsDirty = true;
         if (ImGui.SliderFloat("俯仰周期(秒)", ref _cfg.VerticalPeriodSeconds, 10f, 60f)) _settingsDirty = true;
@@ -489,6 +541,13 @@ public class AutoCinemaPlugin : Plugin
             {
                 _manualCinema = true;
             }
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("强制恢复 HUD"))
+        {
+            HideOverlay(false);
+            ToggleGameHud(false);
+            _status = "已强制恢复 HUD";
         }
     }
 }
